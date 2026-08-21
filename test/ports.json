@@ -498,5 +498,27 @@
       "begin": 11600,
       "end": 11609
     }
+  },
+  "scale-out/cloud_scale_out_locking.bats": {
+    "redis": {
+      "begin": 20040,
+      "end": 20049
+    },
+    "zot0": {
+      "begin": 20060,
+      "end": 20069
+    },
+    "zot1": {
+      "begin": 20080,
+      "end": 20089
+    },
+    "zot2": {
+      "begin": 20100,
+      "end": 20109
+    },
+    "haproxy": {
+      "begin": 8760,
+      "end": 8790
+    }
   }
 }
