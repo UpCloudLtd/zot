@@ -37,7 +37,7 @@ function create_locking_config_file() {
         "dedupe": false,
         "remoteCache": true,
         "gc": true,
-        "gcDelay": "5s",
+        "gcDelay": "30s",
         "gcInterval": "2s",
         "maxRepos": 2,
         "storageDriver": {

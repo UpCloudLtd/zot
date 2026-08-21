@@ -39,7 +39,7 @@ function create_integrity_config_file() {
         "dedupe": false,
         "remoteCache": true,
         "gc": true,
-        "gcDelay": "5s",
+        "gcDelay": "30s",
         "gcInterval": "2s",
         "maxRepos": 100,
         "storageDriver": {
@@ -195,6 +195,130 @@ function verify_repo_content() {
 
     # every tag, every config and layer blob, verified by content hash
     verify_repo_content "integrity"
+}
+
+@test "100 then 200 tags of one manifest concurrently through the LB all survive and verify" {
+    local base=$(lb_url)
+
+    # one shared blob for the repo
+    local content='{"scale":true}'
+    local digest="sha256:$(printf '%s' "${content}" | shasum -a 256 | awk '{print $1}')"
+    local location=$(curl -s -D - -o /dev/null -X POST "${base}/v2/big/blobs/uploads/" \
+        | tr -d '\r' | awk 'tolower($1) == "location:" {print $2}')
+    case "${location}" in
+        http*) ;;
+        *) location="${base}${location}" ;;
+    esac
+    local sep="?"
+    case "${location}" in
+        *\?*) sep="&" ;;
+    esac
+    [ $(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "${content}" "${location}${sep}digest=${digest}") -eq 201 ]
+
+    local manifest="{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"${digest}\",\"size\":${#content}},\"layers\":[{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"${digest}\",\"size\":${#content}}]}"
+
+    hammer() {
+        local from=${1}
+        local to=${2}
+
+        local pids=()
+        for i in $(seq ${from} ${to}); do
+            local tag=$(printf "t%03d" ${i})
+            curl -s -o /dev/null -w "%{http_code}" --max-time 120 -X PUT \
+                -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
+                -d "${manifest}" \
+                "${base}/v2/big/manifests/${tag}" > ${BATS_TEST_TMPDIR}/big-${tag}.code &
+            pids+=($!)
+        done
+
+        for p in "${pids[@]}"; do
+            wait ${p}
+        done
+
+        for i in $(seq ${from} ${to}); do
+            local tag=$(printf "t%03d" ${i})
+            local code=$(cat ${BATS_TEST_TMPDIR}/big-${tag}.code)
+            if [ "${code}" -ne 201 ]; then
+                echo "push of big:${tag} got ${code}" >&3
+                return 1
+            fi
+        done
+    }
+
+    # first hundred concurrent
+    hammer 0 99
+    [ $(curl -s "${base}/v2/big/tags/list" | jq '.tags | length') -eq 100 ]
+
+    # second hundred concurrent, over the index the first hundred wrote
+    hammer 100 199
+    [ $(curl -s "${base}/v2/big/tags/list" | jq '.tags | length') -eq 200 ]
+
+    # every tag resolves and its content verifies
+    verify_repo_content "big"
+}
+
+@test "concurrent pushes of the same image to many repos all land intact" {
+    local haproxy_port=$(cat ${BATS_FILE_TMPDIR}/haproxy.port)
+
+    # ten repos pushed at once through the LB: concurrent repo creation and concurrent
+    # uploads of the same blob digests into different repos on shared storage
+    local pids=()
+    for i in $(seq 1 10); do
+        skopeo --insecure-policy copy --dest-tls-verify=false \
+            oci:${BATS_FILE_TMPDIR}/golang:1.20 \
+            docker://127.0.0.1:${haproxy_port}/many$(printf "%02d" ${i}):v1 \
+            > ${BATS_TEST_TMPDIR}/many-${i}.log 2>&1 &
+        pids+=($!)
+    done
+
+    for p in "${pids[@]}"; do
+        wait ${p}
+    done
+
+    for i in $(seq 1 10); do
+        if [ -s ${BATS_TEST_TMPDIR}/many-${i}.log ] && grep -q "level=fatal" ${BATS_TEST_TMPDIR}/many-${i}.log; then
+            echo "push to many$(printf "%02d" ${i}) failed: $(cat ${BATS_TEST_TMPDIR}/many-${i}.log)" >&3
+            return 1
+        fi
+    done
+
+    # every repo's content verifies by digest
+    for i in $(seq 1 10); do
+        verify_repo_content "many$(printf "%02d" ${i})"
+    done
+}
+
+@test "concurrent pushes of the same image to one repo interleave blob uploads safely" {
+    local haproxy_port=$(cat ${BATS_FILE_TMPDIR}/haproxy.port)
+
+    # six clients push the same image to the same repo at once under different tags:
+    # the blob uploads of identical digests interleave on shared storage
+    local pids=()
+    for i in $(seq 1 6); do
+        skopeo --insecure-policy copy --dest-tls-verify=false \
+            oci:${BATS_FILE_TMPDIR}/golang:1.20 \
+            docker://127.0.0.1:${haproxy_port}/sharedrepo:sk${i} \
+            > ${BATS_TEST_TMPDIR}/sk-${i}.log 2>&1 &
+        pids+=($!)
+    done
+
+    for p in "${pids[@]}"; do
+        wait ${p}
+    done
+
+    for i in $(seq 1 6); do
+        if grep -q "level=fatal" ${BATS_TEST_TMPDIR}/sk-${i}.log 2>/dev/null; then
+            echo "push sk${i} failed: $(cat ${BATS_TEST_TMPDIR}/sk-${i}.log)" >&3
+            return 1
+        fi
+    done
+
+    local base=$(lb_url)
+    [ $(curl -s "${base}/v2/sharedrepo/tags/list" | jq '.tags | length') -eq 6 ]
+
+    verify_repo_content "sharedrepo"
 }
 
 @test "concurrent deletes of the same manifest settle consistently" {
