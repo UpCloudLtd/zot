@@ -8,9 +8,12 @@ import (
 	"os"
 	"path"
 	"testing"
+	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/redis/go-redis/v9"
 	. "github.com/smartystreets/goconvey/convey"
 
 	zerr "zotregistry.dev/zot/v2/errors"
@@ -22,6 +25,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/meta/boltdb"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
+	"zotregistry.dev/zot/v2/pkg/storage/cache"
 	"zotregistry.dev/zot/v2/pkg/storage/local"
 	stypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
@@ -792,5 +796,82 @@ func TestOnDeleteManifest_syncStagingBlocksRepoRemoval(t *testing.T) {
 		repos, err := imgStore.GetRepositories()
 		So(err, ShouldBeNil)
 		So(repos, ShouldContain, repo)
+	})
+}
+
+// TestOnDeleteManifestWaitsForForeignRepoLock proves the delete path cannot remove an emptied repo
+// while another instance holds the repo lock: the removal blocks until the holder releases, so a
+// concurrent push on shared storage cannot have its index swept mid-write.
+func TestOnDeleteManifestWaitsForForeignRepoLock(t *testing.T) {
+	Convey("Repo removal blocks on a repo lock held by another store", t, func() {
+		rootDir := t.TempDir()
+		log := log.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		ctx := context.Background()
+
+		miniRedis := miniredis.RunT(t)
+
+		connOpts, err := redis.ParseURL("redis://" + miniRedis.Addr())
+		So(err, ShouldBeNil)
+
+		client := redis.NewClient(connOpts)
+		t.Cleanup(func() { _ = client.Close() })
+
+		cacheDriver, err := storage.Create("redis",
+			cache.RedisDriverParameters{Client: client, RootDir: rootDir, UseRelPaths: true, KeyPrefix: "zot"}, log)
+		So(err, ShouldBeNil)
+
+		// two stores over one directory stand in for two processes over one bucket
+		storeA := local.NewImageStore(rootDir, false, false, log, metrics, nil, cacheDriver, nil, nil)
+		storeB := local.NewImageStore(rootDir, false, false, log, metrics, nil, cacheDriver, nil, nil)
+
+		scA := storage.StoreController{DefaultStore: storeA}
+		scB := storage.StoreController{DefaultStore: storeB}
+
+		params := boltdb.DBParameters{RootDir: t.TempDir()}
+		boltDriver, err := boltdb.GetBoltDriver(params)
+		So(err, ShouldBeNil)
+
+		metaDB, err := boltdb.New(boltDriver, log)
+		So(err, ShouldBeNil)
+
+		image := CreateDefaultImage()
+		digest := image.Digest()
+		body := image.ManifestDescriptor.Data
+
+		So(WriteImageToFileSystem(image, "repo", "v1", scA), ShouldBeNil)
+		So(meta.OnUpdateManifest(ctx, "repo", "v1", ispec.MediaTypeImageManifest, digest, body, scA, metaDB, log),
+			ShouldBeNil)
+
+		// the manifest is deleted from storage first; only the meta hook remains
+		So(storeB.DeleteImageManifest(ctx, "repo", digest.String(), false), ShouldBeNil)
+
+		// another instance holds the repo lock, as a gc sweep or a push would
+		heldLock, err := storeA.LockRepo(ctx, "repo")
+		So(err, ShouldBeNil)
+
+		done := make(chan error, 1)
+
+		go func() {
+			done <- meta.OnDeleteManifest("repo", digest.String(), ispec.MediaTypeImageManifest, digest, body,
+				scB, metaDB, log)
+		}()
+
+		// the removal must not go through while the other instance holds the lock
+		select {
+		case <-done:
+			t.Fatal("OnDeleteManifest completed while another store held the repo lock")
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		heldLock.Release()
+
+		So(<-done, ShouldBeNil)
+
+		// and once through, the repo is gone from storage and meta
+		So(storeB.DirExists(path.Join(rootDir, "repo")), ShouldBeFalse)
+
+		_, err = metaDB.GetRepoMeta(ctx, "repo")
+		So(err, ShouldEqual, zerr.ErrRepoMetaNotFound)
 	})
 }
