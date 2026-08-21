@@ -513,6 +513,49 @@ func validateCacheConfig(cfg *config.Config, logger zlog.Logger) error {
 	return nil
 }
 
+// isSharedStorageUnclustered reports whether the configuration can serve more than one
+// writable instance over a shared backend without the cluster section: remote storage
+// (default store or any subpath) together with a remote cache, and no cluster membership.
+func isSharedStorageUnclustered(cfg *config.Config) bool {
+	if cfg.Cluster.IsClustered() {
+		return false
+	}
+
+	storageConfig := cfg.CopyStorageConfig()
+
+	if !storageConfig.RemoteCache || storageConfig.CacheDriver == nil {
+		return false
+	}
+
+	if getStorageType(storageConfig.StorageDriver) != storageConstants.LocalStorageDriverName {
+		return true
+	}
+
+	for _, subStorageConfig := range storageConfig.SubPaths {
+		if getStorageType(subStorageConfig.StorageDriver) != storageConstants.LocalStorageDriverName {
+			return true
+		}
+	}
+
+	return false
+}
+
+// warnIfSharedStorageUnclustered warns when the configuration can run more than one
+// writable instance over a shared backend without the cluster section. In that topology
+// repository ownership is not enforced and background tasks such as garbage collection
+// run on every instance, so concurrent writers can overwrite each other's repository
+// index updates and silently lose tags.
+func warnIfSharedStorageUnclustered(cfg *config.Config, logger zlog.Logger) {
+	if !isSharedStorageUnclustered(cfg) {
+		return
+	}
+
+	logger.Warn().Msg("remote storage and remote cache configured without a cluster section: " +
+		"when more than one instance shares this backend, repository ownership is not enforced and " +
+		"background tasks such as garbage collection run on every instance; configure the cluster " +
+		"section for multi-instance deployments")
+}
+
 func validateRemoteSessionStoreConfig(cfg *config.Config, logger zlog.Logger) error {
 	// it is okay for the session driver config to be nil
 	// this is backwards compatible for older configs
@@ -813,6 +856,8 @@ func validateConfiguration(config *config.Config, logger zlog.Logger) error {
 	if err := validateCacheConfig(config, logger); err != nil {
 		return err
 	}
+
+	warnIfSharedStorageUnclustered(config, logger)
 
 	if err := validateRemoteSessionStoreConfig(config, logger); err != nil {
 		return err
