@@ -301,6 +301,19 @@ func releaseIdleRepository(repo string, storeController storage.StoreController,
 
 	imgStore := storeController.GetImageStore(repo)
 
+	// the repo lock comes before the store lock, the order every index writer
+	// uses: without it a concurrent push on another instance could be mid-write
+	// on this repo's index while the layout is removed underneath it
+	repoLock, err := imgStore.LockRepo(context.Background(), repo)
+	if err != nil {
+		log.Error().Err(err).Str("repository", repo).Str("component", "metadb").
+			Msg("failed to lock repo emptied by manifest deletes")
+
+		return
+	}
+
+	defer repoLock.Release()
+
 	var lockLatency time.Time
 
 	imgStore.Lock(&lockLatency)
