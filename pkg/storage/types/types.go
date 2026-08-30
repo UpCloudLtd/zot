@@ -60,7 +60,7 @@ type ImageStore interface { //nolint:interfacebloat
 	) (io.ReadCloser, int64, int64, error)
 	DeleteBlob(repo string, digest godigest.Digest) error
 	CleanupRepo(repo string, blobs []godigest.Digest) (int, error)
-	RemoveIdleRepository(repo string, maxBlobAge time.Duration) (bool, error)
+	RemoveIdleRepository(repo string, maxBlobAge time.Duration, repoLock RepoLock) (bool, error)
 	GetIndexContent(repo string) ([]byte, error)
 	PutIndexContent(repo string, index ispec.Index) error
 	StatIndex(repo string) (bool, int64, time.Time, error)

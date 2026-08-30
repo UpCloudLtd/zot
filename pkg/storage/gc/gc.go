@@ -242,7 +242,7 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 			gc.log.Info().Str("module", "gc").Str("repository", repo).
 				Msg("skipping repository removal: blocked by removal guard")
 		} else {
-			removed, err := gc.imgStore.RemoveIdleRepository(repo, gc.opts.Delay)
+			removed, err := gc.imgStore.RemoveIdleRepository(repo, gc.opts.Delay, repoLock)
 			if err != nil {
 				gc.log.Error().Err(err).Str("module", "gc").Str("repository", repo).
 					Msg("failed to remove idle repo")

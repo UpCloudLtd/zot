@@ -319,7 +319,7 @@ func releaseIdleRepository(repo string, storeController storage.StoreController,
 	imgStore.Lock(&lockLatency)
 	defer imgStore.Unlock(&lockLatency)
 
-	removed, err := imgStore.RemoveIdleRepository(repo, 0)
+	removed, err := imgStore.RemoveIdleRepository(repo, 0, repoLock)
 	if err != nil {
 		log.Error().Err(err).Str("repository", repo).Str("component", "metadb").
 			Msg("failed to remove repo emptied by manifest deletes")

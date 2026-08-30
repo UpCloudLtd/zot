@@ -145,7 +145,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetIndexContentFn: func(repo string) ([]byte, error) {
 					return []byte(`{"schemaVersion":2,"manifests":[]}`), nil
 				},
-				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration, _ storageTypes.RepoLock) (bool, error) {
 					return false, errGC
 				},
 			}
@@ -163,7 +163,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetIndexContentFn: func(repo string) ([]byte, error) {
 					return []byte(`{"schemaVersion":2,"manifests":[]}`), nil
 				},
-				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration, _ storageTypes.RepoLock) (bool, error) {
 					return true, nil
 				},
 			}

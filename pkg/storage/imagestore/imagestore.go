@@ -2122,11 +2122,15 @@ Only the layout is touched here: callers that also track the repository elsewher
 record counting towards storage.maxRepos) are expected to drop that state themselves when this
 returns true, so the repo stops existing everywhere at once.
 
-The caller function MUST lock from outside.
+The caller function MUST lock from outside, holding both the repo lock and the store lock; the
+repo lock is revalidated immediately before the layout delete, so a holder that lost it fails
+instead of removing a repo another instance may be writing to.
 
 Returns true when the layout was removed.
 */
-func (is *ImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration) (bool, error) {
+func (is *ImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration,
+	repoLock storageTypes.RepoLock,
+) (bool, error) {
 	dir := path.Join(is.rootDir, repo)
 	if !is.DirExists(dir) {
 		return false, nil
@@ -2185,6 +2189,13 @@ func (is *ImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration
 	}
 
 	is.log.Info().Str("repository", repo).Msg("removing idle repo")
+
+	// fence: revalidate the repo lock immediately before deleting the layout,
+	// so a holder that lost the lock mid-check fails instead of removing a repo
+	// another instance may be writing to
+	if !repoLock.StillHeld(context.Background()) {
+		return false, zerr.ErrRepoLockUnavailable
+	}
 
 	if err := is.storeDriver.Delete(dir); err != nil {
 		is.log.Error().Err(err).Str("repository", repo).Msg("failed to remove repo")

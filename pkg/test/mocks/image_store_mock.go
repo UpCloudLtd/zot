@@ -61,7 +61,7 @@ type MockedImageStore struct {
 	GetNextDigestWithBlobPathsFn  func(repos []string, lastDigests []godigest.Digest) (godigest.Digest, []string, error)
 	GetAllBlobsFn                 func(repo string) ([]godigest.Digest, error)
 	CleanupRepoFn                 func(repo string, blobs []godigest.Digest) (int, error)
-	RemoveIdleRepositoryFn        func(repo string, maxBlobAge time.Duration) (bool, error)
+	RemoveIdleRepositoryFn        func(repo string, maxBlobAge time.Duration, repoLock storageTypes.RepoLock) (bool, error)
 	PutIndexContentFn             func(repo string, index ispec.Index) error
 	PopulateStorageMetricsFn      func(interval time.Duration, sch *scheduler.Scheduler)
 	StatIndexFn                   func(repo string) (bool, int64, time.Time, error)
@@ -481,9 +481,11 @@ func (is MockedImageStore) CleanupRepo(repo string, blobs []godigest.Digest) (in
 	return 0, nil
 }
 
-func (is MockedImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration) (bool, error) {
+func (is MockedImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration,
+	repoLock storageTypes.RepoLock,
+) (bool, error) {
 	if is.RemoveIdleRepositoryFn != nil {
-		return is.RemoveIdleRepositoryFn(repo, maxBlobAge)
+		return is.RemoveIdleRepositoryFn(repo, maxBlobAge, repoLock)
 	}
 
 	return false, nil
