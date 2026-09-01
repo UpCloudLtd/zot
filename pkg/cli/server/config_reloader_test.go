@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -624,5 +626,99 @@ func TestConfigReloader(t *testing.T) {
 		So(string(data), ShouldContainSubstring, "\"Prefix\":\"zot-test\"")
 		So(string(data), ShouldContainSubstring, "\"Regex\":\".*\"")
 		So(string(data), ShouldContainSubstring, "\"Semver\":true")
+	})
+}
+
+func TestConfigReloaderKubernetesConfigMapUpdate(t *testing.T) {
+	Convey("reload config on a Kubernetes-style atomic symlink swap", t, func() {
+		logPath := test.MakeTempFilePath(t, "zot-log.txt")
+
+		username := "alice"
+		password := "alice"
+
+		htpasswdPath := test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(username, password))
+		rootDir := t.TempDir()
+
+		mkConfig := func(user string) string {
+			return fmt.Sprintf(`{
+				"distSpecVersion": "1.1.1",
+				"storage": {
+				  "rootDirectory": "%s"
+				},
+				"http": {
+				  "address": "127.0.0.1",
+				  "port": "0",
+				  "realm": "zot",
+				  "auth": {
+					"htpasswd": {
+					  "path": "%s"
+					},
+					"failDelay": 1
+				  },
+				  "accessControl": {
+					"repositories": {
+						"**": {
+					  	"policies": [
+							{
+						  	"users": ["%s"],
+						  	"actions": ["read"]
+							}
+					  	],
+					  	"defaultPolicy": ["read"]
+						}
+					}
+				  }
+				},
+				"log": {
+				  "level": "debug",
+				  "output": "%s"
+				}
+			  }`, rootDir, htpasswdPath, user, logPath)
+		}
+
+		// Lay the config out the way kubelet's AtomicWriter mounts a ConfigMap:
+		// config.json -> ..data/config.json -> ..<timestamped dir>/config.json
+		mountDir := t.TempDir()
+		payloadV1 := filepath.Join(mountDir, "..2024_01_01")
+		So(os.MkdirAll(payloadV1, 0o755), ShouldBeNil)
+		So(os.WriteFile(filepath.Join(payloadV1, "config.json"), []byte(mkConfig("charlie")), 0o600), ShouldBeNil)
+		So(os.Symlink("..2024_01_01", filepath.Join(mountDir, "..data")), ShouldBeNil)
+		So(os.Symlink(filepath.Join("..data", "config.json"), filepath.Join(mountDir, "config.json")), ShouldBeNil)
+
+		So(startServerFromConfigFile(t, filepath.Join(mountDir, "config.json")), ShouldBeNil)
+
+		// Update the way kubelet does: write the new payload dir, atomically
+		// retarget the ..data symlink via rename(2), remove the old payload.
+		// No Write event is ever emitted for config.json itself.
+		payloadV2 := filepath.Join(mountDir, "..2024_01_02")
+		So(os.MkdirAll(payloadV2, 0o755), ShouldBeNil)
+		So(os.WriteFile(filepath.Join(payloadV2, "config.json"), []byte(mkConfig("alice")), 0o600), ShouldBeNil)
+		So(os.Symlink("..2024_01_02", filepath.Join(mountDir, "..data_tmp")), ShouldBeNil)
+		So(os.Rename(filepath.Join(mountDir, "..data_tmp"), filepath.Join(mountDir, "..data")), ShouldBeNil)
+		So(os.RemoveAll(payloadV1), ShouldBeNil)
+
+		// wait for the reload: debounced event or, at the latest, a poll tick
+		reloaded := false
+
+		for range 100 {
+			time.Sleep(100 * time.Millisecond)
+
+			data, err := os.ReadFile(logPath)
+			So(err, ShouldBeNil)
+
+			if strings.Contains(string(data), "\"Users\":[\"alice\"]") {
+				reloaded = true
+
+				break
+			}
+		}
+
+		data, err := os.ReadFile(logPath)
+		So(err, ShouldBeNil)
+
+		t.Logf("log file: %s", data)
+		So(reloaded, ShouldBeTrue)
+		So(string(data), ShouldContainSubstring, "reloaded params")
+		So(string(data), ShouldContainSubstring, "loaded new configuration settings")
 	})
 }
