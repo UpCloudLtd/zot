@@ -17,6 +17,8 @@
 #   4. Patches the ConfigMap to grant bob access.
 #   5. Asserts zot logs the reload, bob's requests start succeeding, and the pod
 #      was neither restarted nor recreated.
+#   6. Repoints the events sink through the same ConfigMap and asserts deliveries
+#      follow it, still without a restart.
 #
 # Prerequisites:
 #   make check-blackbox-prerequisites binary
@@ -51,6 +53,7 @@ fi
 
 ZOT_LISTEN_PORT="5000"
 KIND_NODE_IMAGE="kindest/node:v1.28.7"
+RECEIVER_IMAGE="nginx:1.27-alpine"
 POD_WAIT_TIMEOUT="180s"
 # kubelet syncs mounted ConfigMaps on its own cadence (up to about a minute),
 # then the reloader debounce fires; two minutes is a comfortable ceiling.
@@ -128,6 +131,7 @@ bob:$2y$05$UnHJ2xeU/SalnWRjqUf7UeuPG5Q/T4.fkKUBvpTtTPyl81wFw1DP.'
 
 config_json() {
     local users=$1
+    local sink_path=$2
 
     cat <<EOF
 {
@@ -147,16 +151,96 @@ config_json() {
             }
         }
     },
+    "extensions": {
+        "events": {
+            "enable": true,
+            "sinks": [{
+                "type": "http",
+                "address": "http://webhook-receiver${sink_path}",
+                "timeout": "5s"
+            }]
+        }
+    },
     "log": {"level": "debug"}
 }
 EOF
 }
 
+# A receiver that answers every request with 200 and records the path in its
+# access log, so the test can tell which sink an event reached.
+deploy_webhook_receiver() {
+    cat <<EOF | kubectl --context "${KUBECTL_CTX}" apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-receiver-conf
+data:
+  default.conf: |
+    server {
+      listen 80;
+      location / { return 200 'ok'; }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-receiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: webhook-receiver}
+  template:
+    metadata:
+      labels: {app: webhook-receiver}
+    spec:
+      containers:
+      - name: nginx
+        image: ${RECEIVER_IMAGE}
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - {name: conf, mountPath: /etc/nginx/conf.d}
+      volumes:
+      - name: conf
+        configMap: {name: webhook-receiver-conf}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-receiver
+spec:
+  selector: {app: webhook-receiver}
+  ports:
+  - {port: 80, targetPort: 80}
+EOF
+
+    kubectl --context "${KUBECTL_CTX}" wait --for=condition=Available deployment/webhook-receiver \
+        --timeout="${POD_WAIT_TIMEOUT}"
+}
+
+# Starting a blob upload creates the repository, which emits an event.
+trigger_event() {
+    local repo=$1
+
+    curl -s -o /dev/null -X POST -u alice:alice \
+        "http://127.0.0.1:13000/v2/${repo}/blobs/uploads/" || true
+}
+
+receiver_saw() {
+    local path=$1
+
+    kubectl --context "${KUBECTL_CTX}" logs deployment/webhook-receiver 2>/dev/null \
+        | grep -c "POST ${path} " || true
+}
+
+log_info "Deploying the webhook receiver..."
+deploy_webhook_receiver
+
 log_info "Creating Secret, ConfigMap and Deployment..."
 kubectl --context "${KUBECTL_CTX}" create secret generic zot-htpasswd \
     --from-literal=htpasswd="${HTPASSWD}"
 kubectl --context "${KUBECTL_CTX}" create configmap zot-config \
-    --from-literal=config.json="$(config_json '"alice"')"
+    --from-literal=config.json="$(config_json '"alice"' /sink-a)"
 
 cat <<EOF | kubectl --context "${KUBECTL_CTX}" apply -f -
 apiVersion: apps/v1
@@ -222,7 +306,7 @@ done
 
 log_info "Patching the ConfigMap to grant bob access (kubelet AtomicWriter update)..."
 kubectl --context "${KUBECTL_CTX}" create configmap zot-config \
-    --from-literal=config.json="$(config_json '"alice", "bob"')" \
+    --from-literal=config.json="$(config_json '"alice", "bob"' /sink-a)" \
     --dry-run=client -o yaml | kubectl --context "${KUBECTL_CTX}" replace -f -
 
 log_info "Waiting up to ${RELOAD_TIMEOUT_SECONDS}s for the reload to land..."
@@ -265,4 +349,59 @@ if [ "${POD_UID_NOW}" != "${POD_UID}" ] || [ "${RESTARTS}" != "0" ]; then
     exit 1
 fi
 
-log_info "PASS: ConfigMap update reloaded accessControl live, zero pod restarts."
+# ---------------------------------------------------------------------------
+# Events: the same reload must re-point the webhook sink, so a rotated or
+# repaired webhook takes effect without a restart.
+# ---------------------------------------------------------------------------
+log_info "Asserting events reach the configured sink..."
+trigger_event "events-before"
+
+DEADLINE=$(( $(date +%s) + RELOAD_TIMEOUT_SECONDS ))
+while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+    [ "$(receiver_saw /sink-a)" != "0" ] && break
+    sleep 3
+done
+
+if [ "$(receiver_saw /sink-a)" = "0" ]; then
+    log_error "no event reached the initial sink"
+    kubectl --context "${KUBECTL_CTX}" logs "${POD}" | tail -30
+    exit 1
+fi
+
+log_info "Repointing the events sink through the ConfigMap..."
+kubectl --context "${KUBECTL_CTX}" create configmap zot-config \
+    --from-literal=config.json="$(config_json '"alice", "bob"' /sink-b)" \
+    --dry-run=client -o yaml | kubectl --context "${KUBECTL_CTX}" replace -f -
+
+log_info "Waiting up to ${RELOAD_TIMEOUT_SECONDS}s for events to follow the new sink..."
+DEADLINE=$(( $(date +%s) + RELOAD_TIMEOUT_SECONDS ))
+EVENTS_MOVED=0
+while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+    trigger_event "events-after-$(date +%s)"
+
+    if [ "$(receiver_saw /sink-b)" != "0" ]; then
+        EVENTS_MOVED=1
+        break
+    fi
+
+    sleep 5
+done
+
+if [ "${EVENTS_MOVED}" != "1" ]; then
+    log_error "events still going to the old sink after ${RELOAD_TIMEOUT_SECONDS}s"
+    kubectl --context "${KUBECTL_CTX}" logs "${POD}" | grep -E "event|reload" | tail -20
+    exit 1
+fi
+
+log_info "Re-checking pod stability after the events reload..."
+POD_NOW=$(kubectl --context "${KUBECTL_CTX}" get pods -l app=zot -o jsonpath='{.items[0].metadata.name}')
+POD_UID_NOW=$(kubectl --context "${KUBECTL_CTX}" get pod "${POD_NOW}" -o jsonpath='{.metadata.uid}')
+RESTARTS=$(kubectl --context "${KUBECTL_CTX}" get pod "${POD_NOW}" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}')
+
+if [ "${POD_UID_NOW}" != "${POD_UID}" ] || [ "${RESTARTS}" != "0" ]; then
+    log_error "pod changed or restarted during the events reload (restarts ${RESTARTS})"
+    exit 1
+fi
+
+log_info "PASS: ConfigMap update reloaded accessControl and the events sink live, zero pod restarts."
