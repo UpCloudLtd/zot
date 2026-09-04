@@ -48,15 +48,21 @@ type Controller struct {
 	Server          *http.Server
 	Metrics         monitoring.MetricServer
 	EventRecorder   events.Recorder
-	CveScanner      ext.CveScanner
-	SyncOnDemand    ext.SyncOnDemand
-	RelyingParties  map[string]rp.RelyingParty
-	CookieStore     *CookieStore
-	HTPasswd        *HTPasswd
-	HTPasswdWatcher *HTPasswdWatcher
-	LDAPClient      *LDAPClient
-	taskScheduler   *scheduler.Scheduler
-	Healthz         *common.Healthz
+	// the same recorder as EventRecorder, typed so a reload can replace what it
+	// points at without changing the field every consumer was handed
+	eventReloader *events.ReloadableRecorder
+	// fingerprint of the events config the installed recorder was built from,
+	// so a rebuild that failed is retried rather than mistaken for up to date
+	eventsFingerprint string
+	CveScanner        ext.CveScanner
+	SyncOnDemand      ext.SyncOnDemand
+	RelyingParties    map[string]rp.RelyingParty
+	CookieStore       *CookieStore
+	HTPasswd          *HTPasswd
+	HTPasswdWatcher   *HTPasswdWatcher
+	LDAPClient        *LDAPClient
+	taskScheduler     *scheduler.Scheduler
+	Healthz           *common.Healthz
 	// runtime params (atomic: Run may set the port concurrently with GetPort readers, e.g. tests)
 	chosenPort atomic.Int64
 	// TLS certificate management
@@ -448,9 +454,39 @@ func (c *Controller) InitEventRecorder() error {
 		return err
 	}
 
-	c.EventRecorder = eventRecorder
+	// wrapped even when events are disabled, so a reload that enables them has
+	// something to swap into
+	c.eventReloader = events.NewReloadableRecorder(eventRecorder)
+	c.EventRecorder = c.eventReloader
+	c.eventsFingerprint = c.Config.EventsFingerprint()
 
 	return nil
+}
+
+// reloadEventRecorder rebuilds the recorder when the events config changed, so new
+// sinks, URLs and credentials take effect. Its sinks are live connections, hence a
+// rebuild rather than a re-read, and only when the config actually moved.
+func (c *Controller) reloadEventRecorder() {
+	fingerprint := c.Config.EventsFingerprint()
+	if c.eventReloader == nil || fingerprint == c.eventsFingerprint {
+		return
+	}
+
+	eventRecorder, err := ext.NewEventRecorder(c.Config, c.Log)
+	if err != nil && !goerrors.Is(err, errors.ErrExtensionNotEnabled) {
+		// the fingerprint stays behind, so a later reload retries this config
+		c.Log.Error().Err(err).Msg("failed to rebuild event recorder, keeping the previous one")
+
+		return
+	}
+
+	if replaced := c.eventReloader.Swap(eventRecorder); replaced != nil {
+		replaced.Close()
+	}
+
+	c.eventsFingerprint = fingerprint
+
+	c.Log.Info().Bool("enabled", eventRecorder != nil).Msg("reloaded event recorder")
 }
 
 func (c *Controller) LoadNewConfig(newConfig *config.Config) {
@@ -482,6 +518,8 @@ func (c *Controller) LoadNewConfig(newConfig *config.Config) {
 		c.LDAPClient.BindPassword = authConfig.LDAP.BindPassword()
 		c.LDAPClient.lock.Unlock()
 	}
+
+	c.reloadEventRecorder()
 
 	c.InitCVEInfo()
 
